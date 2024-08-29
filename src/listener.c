@@ -22,98 +22,90 @@
 
 #include "spotter.c"
 
-int mSocket;
-FILE *logfile;
-int i, j;
-struct sockaddr_in source, dest;
+#define BUFFER_SIZE 80000
+#define PACKET_SIZE 65536
 
+typedef struct {
+    int socket_fd;
+    char *buffer;
+    struct sockaddr_in source, dest;
+} PacketReceiver;
 
-void createSock() {
-	mSocket = socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
-	if (mSocket < 0) {
-		printf("Socket Error\n");
-		exit(1);
-	}
+int create_socket() {
+    int socket_fd = socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
+    if (socket_fd < 0) {
+        perror("Socket creation failed");
+        exit(EXIT_FAILURE);
+    }
+    return socket_fd;
 }
-void *start_receiver(void *agentI) {
-	struct agentInfo *aInfo = agentI;
-	sem_wait(aInfo->startB);
-	printf("\t+Listener  Started at port [%u]\n", aInfo->mPort);
 
-	openSynFile();
+PacketReceiver* init_packet_receiver() {
+    PacketReceiver *receiver = malloc(sizeof(PacketReceiver));
+    if (!receiver) {
+        perror("Memory allocation failed");
+        exit(EXIT_FAILURE);
+    }
+    receiver->socket_fd = create_socket();
+    receiver->buffer = malloc(BUFFER_SIZE);
+    if (!receiver->buffer) {
+        perror("Memory allocation for buffer failed");
+        free(receiver);
+        exit(EXIT_FAILURE);
+    }
+    return receiver;
+}
 
-	int saddr_size, data_size;
-	struct sockaddr saddr;
+void process_packet(PacketReceiver *receiver, struct agentInfo *aInfo) {
+    struct sockaddr saddr;
+    socklen_t saddr_size = sizeof(saddr);
 
-	char *mBuffer = (char *) malloc(80000);
+    int data_size = recvfrom(receiver->socket_fd, receiver->buffer, PACKET_SIZE, 0, &saddr, &saddr_size);
+    if (data_size < 0) {
+        perror("Failed to receive packets");
+        exit(EXIT_FAILURE);
+    }
 
-	//creates the socket
-	createSock();
+    struct iphdr *iph = (struct iphdr*) receiver->buffer;
+    unsigned short iphdrlen = iph->ihl * 4;
+    struct tcphdr *tcph = (struct tcphdr*) (receiver->buffer + iphdrlen);
 
-	//tmp cache to hold results
-	int tmpFoundHosts = 0;
+    if ((unsigned int) tcph->ack == 1 &&
+        ntohs(tcph->dest) == aInfo->mPort &&
+        ntohl(tcph->ack_seq) == MAGIC_ACKSEQ) {
 
-	//main loop
-	while (endOfScan == FALSE) {
-		saddr_size = sizeof saddr;
+        if ((unsigned int) tcph->rst == 0) {
+            receiver->source.sin_addr.s_addr = iph->saddr;
+            receiver->dest.sin_addr.s_addr = iph->daddr;
 
-		//recieve packets
-		data_size = recvfrom(mSocket, mBuffer, 65536, 0, &saddr, (socklen_t*) &saddr_size);
-		if (data_size < 0) {
-			printf("Recvfrom error , failed to get packets\n");
-			exit(1);
-		}
+            if (!synOnly) {
+                pthread_mutex_lock(&mutex_epfd);
+                while (create_and_connect(inet_ntoa(receiver->source.sin_addr), ntohs(tcph->source), epfd) != 0) {
+                    // printf("problem");
+                }
+                pthread_mutex_unlock(&mutex_epfd);
+            }
 
-		struct iphdr *iph = (struct iphdr*) mBuffer;
-		unsigned short iphdrlen;
-		iphdrlen = iph->ihl * 4;
-		struct tcphdr *tcph = (struct tcphdr*) (mBuffer + iphdrlen);
+            incFoundHosts(1);
+            persistSyn(inet_ntoa(receiver->source.sin_addr), ntohs(tcph->source));
+        }
+    }
+}
 
-		//we uniquely identify packets by magic port and magic ack seq number	
-		if ((unsigned int) tcph->ack == 1 &&
-					 ntohs(tcph->dest) == aInfo->mPort &&
-					 ntohl(tcph->ack_seq) == MAGIC_ACKSEQ) {
-			//port open
-			if ((unsigned int) tcph->rst  == 0 ) {
-				struct iphdr *iph = (struct iphdr *) mBuffer;
-				iphdrlen = (int) iph->ihl * 4;
-				memset(&source, 0, sizeof(source));
-				source.sin_addr.s_addr = (unsigned int) iph->saddr;
-				memset(&dest, 0, sizeof(dest));
-				dest.sin_addr.s_addr = iph->daddr;
+void* start_receiver(void *agentI) {
+    struct agentInfo *aInfo = agentI;
+    sem_wait(aInfo->startB);
+    printf("\t+Listener Started at port [%u]\n", aInfo->mPort);
 
-				if (synOnly == FALSE) {
-					pthread_mutex_lock (&mutex_epfd);
-					while (create_and_connect(inet_ntoa(source.sin_addr), ntohs(tcph->source), epfd) != 0) {
-						//printf("problem");
-					} 
-					pthread_mutex_unlock (&mutex_epfd);
-				}
-				
-				//increments counter result
-				tmpFoundHosts++;
-				if (tmpFoundHosts >= CACHE_SYNC) {
-					incFoundHosts(tmpFoundHosts);
-					tmpFoundHosts = 0;
-				}
-				//persists results
-				persistSyn(inet_ntoa(source.sin_addr), ntohs(tcph->source));
-			} else { //port closed
-				//persists results
-				//persistClosedSyn(inet_ntoa(source.sin_addr), ntohs(tcph->source));
-			}
-		} else { //uncomment for debugging purposes
-			/*struct iphdr *iph = (struct iphdr *) mBuffer;
-			iphdrlen = (int) iph->ihl * 4;
-			memset(&source, 0, sizeof(source));
-			source.sin_addr.s_addr = (unsigned int) iph->saddr;
-			memset(&dest, 0, sizeof(dest));
-			dest.sin_addr.s_addr = iph->daddr;
-			printf("\nTo[%d] From[%s:%d] syn[%d] ack[%d] rst[%d] ack_seq[%d] fin[%d]\n",tcph->source,inet_ntoa(source.sin_addr),
-			ntohs(tcph->source), (unsigned int) tcph->syn,(unsigned int) tcph->ack,(unsigned int) tcph->rst,ntohl(tcph->ack_seq),(unsigned int) tcph->fin );
-			*/
-		}
-	}
-	close(mSocket);
-	return NULL;
+    openSynFile();
+    PacketReceiver *receiver = init_packet_receiver();
+
+    while (!endOfScan) {
+        process_packet(receiver, aInfo);
+    }
+
+    close(receiver->socket_fd);
+    free(receiver->buffer);
+    free(receiver);
+    return NULL;
 }
